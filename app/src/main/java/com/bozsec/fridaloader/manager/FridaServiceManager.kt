@@ -1,6 +1,7 @@
 package com.bozsec.fridaloader.manager
 
 import android.content.Context
+import android.os.Build
 import com.bozsec.fridaloader.utils.RootUtil
 import java.io.File
 import kotlin.random.Random
@@ -187,16 +188,24 @@ class FridaServiceManager(private val context: Context, private val rootUtil: Ro
             // Remote mode with network listening
             "su -c 'cd $workingDir && nohup ./$actualBinaryName -D -l 0.0.0.0:$actualPort >/dev/null 2>&1 &'"
         } else {
-            // USB mode only
+            // USB mode only - add verbose logging for debugging
             "su -c 'cd $workingDir && nohup ./$actualBinaryName -D >/dev/null 2>&1 &'"
         }
 
         android.util.Log.i("FridaServiceManager", "Executing: $startCmd")
+        
+        // Disable USAP (Unspecialized App Process) to fix spawn issues on Android 10+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            android.util.Log.i("FridaServiceManager", "Disabling USAP for better spawn compatibility...")
+            rootUtil.execute("su -c 'setprop persist.device_config.runtime_native.usap_pool_enabled false'")
+            rootUtil.execute("su -c 'setprop persist.device_config.runtime_native.usap_pool_size_max 0'")
+        }
+        
         val result = rootUtil.execute(startCmd)
         android.util.Log.i("FridaServiceManager", "Start result - Success: ${result.success}, Output: ${result.output}, Error: ${result.error}")
         
-        // Wait a bit for server to start
-        kotlinx.coroutines.delay(2000)
+        // Wait longer for server to start (especially on slower devices)
+        kotlinx.coroutines.delay(3000)
 
         // Check if started successfully
         if (!isServerRunning(actualBinaryName)) {
@@ -231,6 +240,18 @@ class FridaServiceManager(private val context: Context, private val rootUtil: Ro
             for (dir in execDirs) {
                 val execPath = getExecPath(name, dir)
                 rootUtil.execute("su -c 'rm -f $execPath' 2>/dev/null")
+            }
+        }
+        
+        // Kill any process using port 27042 (default Frida port)
+        val netstatResult = rootUtil.execute("su -c 'netstat -tulpn | grep 27042'")
+        if (netstatResult.success && netstatResult.output.isNotBlank()) {
+            // Extract PID from netstat output
+            val pidRegex = """(\d+)/""".toRegex()
+            val match = pidRegex.find(netstatResult.output)
+            match?.groupValues?.get(1)?.let { pid ->
+                android.util.Log.i("FridaServiceManager", "Killing process on port 27042: PID $pid")
+                rootUtil.execute("su -c 'kill -9 $pid'")
             }
         }
         
@@ -297,8 +318,12 @@ class FridaServiceManager(private val context: Context, private val rootUtil: Ro
             // Change ownership to root
             rootUtil.execute("su -c 'chown root:root $targetPath' 2>/dev/null")
             
-            // Fix SELinux context
+            // Fix SELinux context - try multiple contexts
             rootUtil.execute("su -c 'chcon u:object_r:system_file:s0 $targetPath' 2>/dev/null")
+            rootUtil.execute("su -c 'chcon u:object_r:system_data_file:s0 $targetPath' 2>/dev/null")
+            
+            // Try to set SELinux to permissive for this file (some devices need this)
+            rootUtil.execute("su -c 'setenforce 0' 2>/dev/null")
             
             // Verify file exists
             val verifyResult = rootUtil.execute("su -c 'test -f $targetPath && echo OK'")

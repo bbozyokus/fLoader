@@ -16,7 +16,11 @@ import android.os.Build
 
 class FridaRepository(
     private val rootUtil: RootUtil = RootUtil(),
-    private val client: OkHttpClient = OkHttpClient()
+    private val client: OkHttpClient = OkHttpClient.Builder()
+        .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+        .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+        .writeTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+        .build()
 ) {
     private val gson = Gson()
     
@@ -57,34 +61,46 @@ class FridaRepository(
     suspend fun fetchAvailableVersions(): List<String> {
         return withContext(Dispatchers.IO) {
             try {
+                android.util.Log.i("FridaRepository", "Fetching Frida versions from GitHub...")
                 val allReleases = mutableListOf<GitHubRelease>()
                 
                 // Fetch multiple pages to get older versions (16.x, 15.x etc.)
                 for (page in 1..5) {
-                    val request = Request.Builder()
-                        .url("https://api.github.com/repos/frida/frida/releases?per_page=50&page=$page")
-                        .build()
+                    try {
+                        val request = Request.Builder()
+                            .url("https://api.github.com/repos/frida/frida/releases?per_page=50&page=$page")
+                            .build()
 
-                    val response = client.newCall(request).execute()
-                    if (!response.isSuccessful) break
+                        val response = client.newCall(request).execute()
+                        if (!response.isSuccessful) {
+                            android.util.Log.w("FridaRepository", "Page $page failed: ${response.code}")
+                            break
+                        }
 
-                    val body = response.body?.string() ?: break
-                    val releases = gson.fromJson(body, Array<GitHubRelease>::class.java)
-                    
-                    if (releases.isEmpty()) break
-                    allReleases.addAll(releases)
-                    
-                    // Stop if we have 15.0.x versions
-                    if (releases.any { it.tagName.startsWith("15.0.") }) break
+                        val body = response.body?.string() ?: break
+                        val releases = gson.fromJson(body, Array<GitHubRelease>::class.java)
+                        
+                        if (releases.isEmpty()) break
+                        allReleases.addAll(releases)
+                        android.util.Log.i("FridaRepository", "Fetched page $page: ${releases.size} releases")
+                        
+                        // Stop if we have 15.0.x versions
+                        if (releases.any { it.tagName.startsWith("15.0.") }) break
+                    } catch (e: Exception) {
+                        android.util.Log.e("FridaRepository", "Error fetching page $page: ${e.message}")
+                        break
+                    }
                 }
                 
                 // Cache releases
                 cachedReleases = allReleases.toList()
                 
+                android.util.Log.i("FridaRepository", "Total releases fetched: ${allReleases.size}")
+                
                 // Return version tags
                 allReleases.map { it.tagName }.toList()
             } catch (e: Exception) {
-                android.util.Log.e("FridaRepository", "Error fetching versions: ${e.message}")
+                android.util.Log.e("FridaRepository", "Error fetching versions: ${e.message}", e)
                 emptyList()
             }
         }
@@ -96,21 +112,45 @@ class FridaRepository(
                 android.util.Log.i("FridaRepository", "Downloading Frida version: $selectedVersion")
                 
                 // Use cached releases or fetch new ones
-                val releases = cachedReleases ?: run {
-                    val request = Request.Builder()
-                        .url("https://api.github.com/repos/frida/frida/releases?per_page=30")
-                        .build()
+                var releases = cachedReleases
+                
+                // If no cache, fetch all versions first
+                if (releases == null) {
+                    android.util.Log.i("FridaRepository", "No cached releases, fetching all versions...")
+                    fetchAvailableVersions() // This will populate cachedReleases
+                    releases = cachedReleases
+                }
+                
+                // If still null or version not found, try fetching again with more pages
+                if (releases == null || releases.find { it.tagName == selectedVersion } == null) {
+                    android.util.Log.i("FridaRepository", "Version not in cache, fetching more releases...")
+                    val allReleases = mutableListOf<GitHubRelease>()
+                    
+                    for (page in 1..10) {
+                        val request = Request.Builder()
+                            .url("https://api.github.com/repos/frida/frida/releases?per_page=50&page=$page")
+                            .build()
 
-                    val response = client.newCall(request).execute()
-                    if (!response.isSuccessful) throw IOException("Failed to fetch releases: $response")
+                        val response = client.newCall(request).execute()
+                        if (!response.isSuccessful) break
 
-                    val body = response.body?.string() ?: return@withContext null
-                    gson.fromJson(body, Array<GitHubRelease>::class.java).toList()
+                        val body = response.body?.string() ?: break
+                        val pageReleases = gson.fromJson(body, Array<GitHubRelease>::class.java)
+                        
+                        if (pageReleases.isEmpty()) break
+                        allReleases.addAll(pageReleases)
+                        
+                        // Stop if we found the version we're looking for
+                        if (pageReleases.any { it.tagName == selectedVersion }) break
+                    }
+                    
+                    releases = allReleases.toList()
+                    cachedReleases = releases
                 }
                 
                 // Find exact version match
-                val release = releases.find { it.tagName == selectedVersion }
-                    ?: throw IOException("Version $selectedVersion not found")
+                val release = releases?.find { it.tagName == selectedVersion }
+                    ?: throw IOException("Version $selectedVersion not found in ${releases?.size ?: 0} releases")
                 
                 android.util.Log.i("FridaRepository", "Found release: ${release.tagName}")
 

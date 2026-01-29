@@ -15,6 +15,7 @@ import com.bozsec.fridaloader.manager.FridaServiceManager
 import com.bozsec.fridaloader.repository.FridaRepository
 import com.bozsec.fridaloader.utils.NetworkUtil
 import com.bozsec.fridaloader.utils.RootUtil
+import com.bozsec.fridaloader.utils.ProxyManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -31,9 +32,13 @@ class MainActivity : AppCompatActivity() {
     private val rootUtil = RootUtil()
     private val repository = FridaRepository(rootUtil)
     private lateinit var manager: FridaServiceManager
+    private lateinit var proxyManager: ProxyManager
     
     // Server running state
     private var isServerRunning = false
+    
+    // Proxy running state
+    private var isProxyRunning = false
     
     // SharedPreferences constants
     private val PREFS_NAME = "FridaLoaderPrefs"
@@ -171,10 +176,33 @@ class MainActivity : AppCompatActivity() {
                     
                     binding.spinnerFridaVersion.isEnabled = true
                 } else {
-                    Toast.makeText(this@MainActivity, "Failed to load versions", Toast.LENGTH_SHORT).show()
+                    // No versions loaded - show error with helpful message
+                    val errorAdapter = android.widget.ArrayAdapter(
+                        this@MainActivity, 
+                        android.R.layout.simple_spinner_item, 
+                        listOf("Failed to load - Check network")
+                    )
+                    errorAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+                    binding.spinnerFridaVersion.adapter = errorAdapter
+                    binding.spinnerFridaVersion.isEnabled = false
+                    
+                    Toast.makeText(this@MainActivity, "Failed to load versions. Check internet/proxy settings.", Toast.LENGTH_LONG).show()
                 }
             } catch (e: Exception) {
-                Toast.makeText(this@MainActivity, "Error: ${e.message}", Toast.LENGTH_SHORT).show()
+                android.util.Log.e("MainActivity", "Error loading versions: ${e.message}", e)
+                
+                val errorAdapter = android.widget.ArrayAdapter(
+                    this@MainActivity, 
+                    android.R.layout.simple_spinner_item, 
+                    listOf("Error - Retry later")
+                )
+                errorAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+                binding.spinnerFridaVersion.adapter = errorAdapter
+                binding.spinnerFridaVersion.isEnabled = false
+                
+                Toast.makeText(this@MainActivity, "Error loading versions: ${e.message}", Toast.LENGTH_LONG).show()
+            } finally {
+                binding.spinnerFridaVersion.isEnabled = fridaVersions.isNotEmpty()
             }
         }
     }
@@ -189,6 +217,7 @@ class MainActivity : AppCompatActivity() {
         
         // Initialize manager with context
         manager = FridaServiceManager(this, rootUtil)
+        proxyManager = ProxyManager(this)
         
         // Show first-time setup dialog if needed
         showFirstTimeSetupIfNeeded()
@@ -306,6 +335,17 @@ class MainActivity : AppCompatActivity() {
             val isRemote = checkedId == binding.radioRemote.id
             binding.layoutPort.visibility = if (isRemote) View.VISIBLE else View.GONE
         }
+        
+        // Proxy settings
+        binding.btnToggleProxy.setOnClickListener {
+            toggleProxy()
+        }
+        
+        binding.btnResetNetwork.setOnClickListener {
+            resetNetwork()
+        }
+        
+        // Don't load current proxy on startup - let user control it manually
     }
     
     private fun showDebugInfo() {
@@ -653,5 +693,147 @@ class MainActivity : AppCompatActivity() {
                 binding.progressBar.visibility = View.GONE
             }
         }
+    }
+    
+    private fun toggleProxy() {
+        if (isProxyRunning) {
+            clearProxy()
+        } else {
+            applyProxy()
+        }
+    }
+    
+    private fun updateProxyButton() {
+        if (isProxyRunning) {
+            binding.btnToggleProxy.text = "Stop Proxy"
+            binding.btnToggleProxy.backgroundTintList = android.content.res.ColorStateList.valueOf(Color.parseColor("#D32F2F"))
+        } else {
+            binding.btnToggleProxy.text = "Start Proxy"
+            binding.btnToggleProxy.backgroundTintList = android.content.res.ColorStateList.valueOf(Color.parseColor("#6200EE"))
+        }
+    }
+    
+    private fun applyProxy() {
+        val address = binding.etProxyAddress.text.toString().trim()
+        val portStr = binding.etProxyPort.text.toString().trim()
+        val bypass = binding.etProxyBypass.text.toString().trim()
+        
+        if (address.isEmpty()) {
+            Toast.makeText(this, "Please enter proxy address", Toast.LENGTH_SHORT).show()
+            return
+        }
+        
+        val port = portStr.toIntOrNull()
+        if (port == null || port <= 0 || port > 65535) {
+            Toast.makeText(this, "Invalid port number", Toast.LENGTH_SHORT).show()
+            return
+        }
+        
+        scope.launch {
+            try {
+                binding.btnToggleProxy.isEnabled = false
+                binding.tvProxyStatus.text = "Applying proxy..."
+                binding.tvProxyStatus.setTextColor(Color.parseColor("#FFA500")) // Orange
+                
+                val success = withContext(Dispatchers.IO) {
+                    proxyManager.setWifiProxy(address, port, bypass)
+                }
+                
+                if (success) {
+                    isProxyRunning = true
+                    updateProxyButton()
+                    binding.tvProxyStatus.text = "Active: $address:$port"
+                    binding.tvProxyStatus.setTextColor(Color.GREEN)
+                    Toast.makeText(this@MainActivity, "Proxy started successfully!", Toast.LENGTH_SHORT).show()
+                } else {
+                    binding.tvProxyStatus.text = "Failed to apply proxy"
+                    binding.tvProxyStatus.setTextColor(Color.RED)
+                    Toast.makeText(this@MainActivity, "Failed to apply proxy (check root)", Toast.LENGTH_LONG).show()
+                }
+            } catch (e: Exception) {
+                binding.tvProxyStatus.text = "Error: ${e.message}"
+                binding.tvProxyStatus.setTextColor(Color.RED)
+                Toast.makeText(this@MainActivity, "Error: ${e.message}", Toast.LENGTH_LONG).show()
+            } finally {
+                binding.btnToggleProxy.isEnabled = true
+            }
+        }
+    }
+    
+    private fun clearProxy() {
+        android.app.AlertDialog.Builder(this)
+            .setTitle("Stop Proxy")
+            .setMessage("Remove WiFi proxy settings?")
+            .setPositiveButton("Yes") { _, _ ->
+                scope.launch {
+                    try {
+                        binding.btnToggleProxy.isEnabled = false
+                        binding.tvProxyStatus.text = "Clearing proxy..."
+                        binding.tvProxyStatus.setTextColor(Color.parseColor("#FFA500"))
+                        
+                        val success = withContext(Dispatchers.IO) {
+                            proxyManager.clearWifiProxy()
+                        }
+                        
+                        if (success) {
+                            isProxyRunning = false
+                            updateProxyButton()
+                            binding.tvProxyStatus.text = "No proxy configured"
+                            binding.tvProxyStatus.setTextColor(Color.GRAY)
+                            Toast.makeText(this@MainActivity, "Proxy cleared! WiFi reconnecting...", Toast.LENGTH_LONG).show()
+                        } else {
+                            binding.tvProxyStatus.text = "Failed to clear proxy"
+                            binding.tvProxyStatus.setTextColor(Color.RED)
+                            Toast.makeText(this@MainActivity, "Failed to clear proxy", Toast.LENGTH_SHORT).show()
+                        }
+                    } catch (e: Exception) {
+                        Toast.makeText(this@MainActivity, "Error: ${e.message}", Toast.LENGTH_SHORT).show()
+                    } finally {
+                        binding.btnToggleProxy.isEnabled = true
+                    }
+                }
+            }
+            .setNegativeButton("No", null)
+            .show()
+    }
+    
+    private fun resetNetwork() {
+        android.app.AlertDialog.Builder(this)
+            .setTitle("Reset Network")
+            .setMessage("This will:\n• Clear all proxy settings\n• Restart WiFi\n• Fix DNS issues\n\nUse this if you have connection problems.\n\nContinue?")
+            .setPositiveButton("Yes") { _, _ ->
+                scope.launch {
+                    try {
+                        binding.btnResetNetwork.isEnabled = false
+                        binding.tvProxyStatus.text = "Resetting network..."
+                        binding.tvProxyStatus.setTextColor(Color.parseColor("#FF9800"))
+                        
+                        val success = withContext(Dispatchers.IO) {
+                            proxyManager.resetNetwork()
+                        }
+                        
+                        if (success) {
+                            binding.tvProxyStatus.text = "Network reset complete"
+                            binding.tvProxyStatus.setTextColor(Color.GREEN)
+                            Toast.makeText(this@MainActivity, "Network reset! WiFi reconnecting...", Toast.LENGTH_LONG).show()
+                            
+                            // Hide status after 3 seconds
+                            kotlinx.coroutines.delay(3000)
+                            binding.tvProxyStatus.text = "No proxy configured"
+                            binding.tvProxyStatus.setTextColor(Color.GRAY)
+                        } else {
+                            binding.tvProxyStatus.text = "Reset failed"
+                            binding.tvProxyStatus.setTextColor(Color.RED)
+                            Toast.makeText(this@MainActivity, "Reset failed", Toast.LENGTH_SHORT).show()
+                        }
+                    } catch (e: Exception) {
+                        Toast.makeText(this@MainActivity, "Error: ${e.message}", Toast.LENGTH_SHORT).show()
+                    } finally {
+                        binding.btnResetNetwork.isEnabled = true
+                    }
+                }
+            }
+            .setNegativeButton("No", null)
+            .show()
     }
 }
