@@ -7,6 +7,10 @@
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
     
+    <!-- Required for Android 11+ to query all installed packages -->
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"
+        tools:ignore="QueryAllPackagesPermission" />
+    
     <!-- Note: Root access doesn't require a manifest permission, but we request it at runtime via 'su' -->
 
     <application

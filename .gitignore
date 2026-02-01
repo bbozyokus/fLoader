@@ -77,3 +77,5 @@ lint/tmp/
 .Trashes
 ehthumbs.db
 Thumbs.db
+
+.kiro/

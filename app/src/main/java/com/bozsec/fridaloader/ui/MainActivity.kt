@@ -3,22 +3,36 @@ package com.bozsec.fridaloader.ui
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
+import android.content.pm.ApplicationInfo
+import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Bundle
 import android.os.Build
 import android.view.View
 import java.io.File
+import android.widget.ArrayAdapter
 import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.app.AppCompatDelegate
+import androidx.lifecycle.lifecycleScope
 import com.bozsec.fridaloader.databinding.ActivityMainBinding
 import com.bozsec.fridaloader.manager.FridaServiceManager
 import com.bozsec.fridaloader.repository.FridaRepository
+import com.bozsec.fridaloader.ssl.AppAnalysisResult
+import com.bozsec.fridaloader.ssl.AppTechnology
+import com.bozsec.fridaloader.ssl.BypassError
+import com.bozsec.fridaloader.ssl.ProcessStep
+import com.bozsec.fridaloader.ssl.ProxyConfig
+import com.bozsec.fridaloader.ssl.SSLBypassManager
 import com.bozsec.fridaloader.utils.NetworkUtil
 import com.bozsec.fridaloader.utils.RootUtil
 import com.bozsec.fridaloader.utils.ProxyManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import android.graphics.Color
@@ -39,6 +53,30 @@ class MainActivity : AppCompatActivity() {
     
     // Proxy running state
     private var isProxyRunning = false
+    
+    // SSL Bypass related
+    private lateinit var sslBypassManager: SSLBypassManager
+    private var isLibraryCheckExpanded = false
+    private var installedApps = mutableListOf<AppInfo>()
+    private var userApps = mutableListOf<AppInfo>()
+    private var allAppsAdapter: ArrayAdapter<AppInfo>? = null
+    private var selectedLibraryCheckApp: AppInfo? = null
+    private var currentAnalysisResult: AppAnalysisResult? = null
+    
+    // Data class for installed app info
+    data class AppInfo(
+        val packageName: String,
+        val appName: String,
+        val isSystemApp: Boolean = false
+    ) {
+        override fun toString(): String = if (isSystemApp) {
+            "$appName ($packageName) [System]"
+        } else {
+            "$appName ($packageName)"
+        }
+    }
+    
+
     
     // SharedPreferences constants
     private val PREFS_NAME = "FridaLoaderPrefs"
@@ -218,11 +256,20 @@ class MainActivity : AppCompatActivity() {
         // Initialize manager with context
         manager = FridaServiceManager(this, rootUtil)
         proxyManager = ProxyManager(this)
+        sslBypassManager = SSLBypassManager(this, rootUtil)
         
         // Show first-time setup dialog if needed
         showFirstTimeSetupIfNeeded()
 
         initUI()
+        initSslBypassUI()
+        // observeSslBypassState() - Removed as only analysis state is needed and handled differently or not needed if sync/async
+        // Actually we still use analyzeApp which updates state, so we might want to keep a minimal observer or just let it be.
+        // But since we are removing observeSslBypassState method later, we should remove the call here.
+        // WAIT: analyzeApp updates _state.value. We can keep observing it for "Analyzing..." status if we want, 
+        // BUT the new design might just show progress in the dialog or card.
+        // Let's keep it simple and remove it for now, as we will use local progress for analysis if possible or keep minimal observer.
+        // For now, removing.
         performStartupChecks()
     }
 
@@ -736,13 +783,25 @@ class MainActivity : AppCompatActivity() {
                 binding.tvProxyStatus.setTextColor(Color.parseColor("#FFA500")) // Orange
                 
                 val success = withContext(Dispatchers.IO) {
-                    proxyManager.setWifiProxy(address, port, bypass)
+                    // Method 1: Standard Android Proxy
+                    val wifiSuccess = proxyManager.setWifiProxy(address, port, bypass)
+                    
+                    // Method 2: Transparent Proxy (Iptables) - Essential for Flutter
+                    val enableTcp = binding.cbProxyTcpRedirect.isChecked
+                    val enableUdp = binding.cbProxyUdpBlock.isChecked
+                    val enableIpv6 = binding.cbProxyIpv6Block.isChecked
+                    
+                    val transparentSuccess = proxyManager.setTransparentProxy(
+                        address, port, enableTcp, enableUdp, enableIpv6
+                    )
+                    
+                    wifiSuccess || transparentSuccess
                 }
                 
                 if (success) {
                     isProxyRunning = true
                     updateProxyButton()
-                    binding.tvProxyStatus.text = "Active: $address:$port"
+                    binding.tvProxyStatus.text = "Active (Transparent): $address:$port"
                     binding.tvProxyStatus.setTextColor(Color.GREEN)
                     Toast.makeText(this@MainActivity, "Proxy started successfully!", Toast.LENGTH_SHORT).show()
                 } else {
@@ -772,7 +831,9 @@ class MainActivity : AppCompatActivity() {
                         binding.tvProxyStatus.setTextColor(Color.parseColor("#FFA500"))
                         
                         val success = withContext(Dispatchers.IO) {
-                            proxyManager.clearWifiProxy()
+                            val wifiCleared = proxyManager.clearWifiProxy()
+                            val transparentCleared = proxyManager.clearTransparentProxy()
+                            wifiCleared || transparentCleared
                         }
                         
                         if (success) {
@@ -835,5 +896,260 @@ class MainActivity : AppCompatActivity() {
             }
             .setNegativeButton("No", null)
             .show()
+    }
+    
+    // ============================================================================
+    // UI INITIALIZATION METHODS
+    // ============================================================================
+    
+    /**
+     * Initialize all SSL Bypass related UI components.
+     * Sets up Library Check, Patch APK, and Flutter SSL Bypass cards.
+     */
+    /**
+     * Initialize all SSL Bypass related UI components.
+     * Sets up Library Check card.
+     */
+    private fun initSslBypassUI() {
+        initLibraryCheckUI()
+        
+        // Load installed apps for library check
+        loadInstalledApps()
+    }
+
+    /**
+     * Toggle Library Check card expand/collapse state.
+     */
+    private fun toggleLibraryCheckCard() {
+        isLibraryCheckExpanded = !isLibraryCheckExpanded
+        
+        if (isLibraryCheckExpanded) {
+            binding.layoutLibraryCheckContent.visibility = View.VISIBLE
+            binding.ivLibraryCheckExpand.rotation = 180f
+        } else {
+            binding.layoutLibraryCheckContent.visibility = View.GONE
+            binding.ivLibraryCheckExpand.rotation = 0f
+        }
+    }
+    
+    /**
+     * Initialize Library Check card UI components.
+     */
+    private fun initLibraryCheckUI() {
+        // Setup expand/collapse functionality
+        binding.layoutLibraryCheckHeader.setOnClickListener {
+            toggleLibraryCheckCard()
+        }
+        
+        // Setup Analyze Libraries button
+        binding.btnAnalyzeLibraries.setOnClickListener {
+            analyzeLibraries()
+        }
+        
+        // Setup system apps checkbox
+        binding.cbIncludeSystemApps.setOnCheckedChangeListener { _, _ ->
+            updateLibraryCheckAppList()
+        }
+    }
+    
+
+    
+    /**
+     * Load installed apps into the spinners.
+     * Populates both general app list and Flutter-only app list.
+     * Uses a reliable method to detect user vs system apps.
+     * 
+     * _Requirements: 1.1_
+     */
+    private fun loadInstalledApps() {
+        scope.launch {
+            try {
+                val apps = withContext(Dispatchers.IO) {
+                    val pm = packageManager
+                    val packages = pm.getInstalledApplications(PackageManager.GET_META_DATA)
+                    
+                    packages
+                        .mapNotNull { appInfo ->
+                            try {
+                                // Simple and reliable system app detection:
+                                // An app is a system app ONLY if it has SYSTEM flag AND is NOT in /data/app/
+                                val hasSystemFlag = (appInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0
+                                val isInDataApp = appInfo.sourceDir?.contains("/data/app/") == true
+                                
+                                // If app is in /data/app/, it's always a user app regardless of flags
+                                val isSystemApp = hasSystemFlag && !isInDataApp
+                                
+                                AppInfo(
+                                    packageName = appInfo.packageName,
+                                    appName = pm.getApplicationLabel(appInfo).toString(),
+                                    isSystemApp = isSystemApp
+                                )
+                            } catch (e: Exception) {
+                                null
+                            }
+                        }
+                        .sortedWith(compareBy<AppInfo> { it.isSystemApp }.thenBy { it.appName.lowercase() })
+                }
+                
+                installedApps.clear()
+                installedApps.addAll(apps)
+                
+                // Separate user apps for filtering
+                userApps.clear()
+                userApps.addAll(apps.filter { !it.isSystemApp })
+                
+                // Setup Library Check spinner (respects checkbox state)
+                updateLibraryCheckAppList()
+                
+            } catch (e: Exception) {
+                android.util.Log.e("MainActivity", "Error loading apps: ${e.message}", e)
+                Toast.makeText(this@MainActivity, "Failed to load apps", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+    
+    /**
+     * Update Library Check app list based on checkbox state.
+     */
+    private fun updateLibraryCheckAppList() {
+        val includeSystemApps = binding.cbIncludeSystemApps.isChecked
+        val appsToShow = if (includeSystemApps) installedApps else userApps
+        
+        setupLibraryCheckSpinner(appsToShow)
+        
+        // Clear current selection if it's no longer in the list
+        selectedLibraryCheckApp?.let { selected ->
+            if (!appsToShow.contains(selected)) {
+                selectedLibraryCheckApp = null
+                binding.actvLibraryCheckApps.setText("")
+                resetLibraryAnalysisResults()
+            }
+        }
+    }
+    
+    /**
+     * Setup Library Check AutoCompleteTextView with specified app list.
+     */
+    private fun setupLibraryCheckSpinner(apps: List<AppInfo> = installedApps) {
+        allAppsAdapter = ArrayAdapter(
+            this@MainActivity,
+            android.R.layout.simple_dropdown_item_1line,
+            apps
+        )
+        
+        binding.actvLibraryCheckApps.setAdapter(allAppsAdapter)
+        binding.actvLibraryCheckApps.threshold = 1 // Start filtering after 1 character
+        
+        // Setup selection listener
+        binding.actvLibraryCheckApps.setOnItemClickListener { _, _, position, _ ->
+            selectedLibraryCheckApp = allAppsAdapter?.getItem(position)
+            resetLibraryAnalysisResults()
+        }
+        
+        // Clear selection when text is manually changed
+        binding.actvLibraryCheckApps.setOnFocusChangeListener { _, hasFocus ->
+            if (!hasFocus) {
+                val currentText = binding.actvLibraryCheckApps.text.toString()
+                val matchingApp = apps.find { it.toString() == currentText }
+                if (matchingApp == null) {
+                    selectedLibraryCheckApp = null
+                    binding.actvLibraryCheckApps.setText("")
+                }
+            }
+        }
+    }
+    
+
+    
+    // ============================================================================
+    // LIBRARY CHECK METHODS
+    // ============================================================================
+    
+    /**
+     * Analyze libraries for the selected app in Library Check card.
+     */
+    private fun analyzeLibraries() {
+        scope.launch {
+            try {
+                val selectedApp = selectedLibraryCheckApp
+                if (selectedApp == null) {
+                    showError("Please select an app to analyze")
+                    return@launch
+                }
+                
+                // Disable button during analysis
+                binding.btnAnalyzeLibraries.isEnabled = false
+                
+                val result = withContext(Dispatchers.IO) {
+                    sslBypassManager.analyzeApp(selectedApp.packageName)
+                }
+                
+                // Show results in Library Check card
+                showLibraryAnalysisResults(result)
+                
+            } catch (e: Exception) {
+                showError("Library analysis failed: ${e.message}")
+            } finally {
+                binding.btnAnalyzeLibraries.isEnabled = true
+            }
+        }
+    }
+    
+    /**
+     * Display library analysis results in the Library Check card.
+     */
+    private fun showLibraryAnalysisResults(result: AppAnalysisResult) {
+        binding.layoutLibraryResults.visibility = View.VISIBLE
+        
+        // Technology
+        binding.tvLibraryTechnology.text = result.technology.name
+        binding.tvLibraryTechnology.setTextColor(
+            when (result.technology) {
+                AppTechnology.FLUTTER -> Color.GREEN
+                AppTechnology.REACT_NATIVE -> Color.BLUE
+                AppTechnology.XAMARIN -> Color.MAGENTA
+                AppTechnology.NATIVE_JAVA_KOTLIN -> Color.CYAN
+                else -> Color.GRAY
+            }
+        )
+        
+        // SSL Method
+        binding.tvLibrarySslMethod.text = result.sslPinningMethod.name
+        
+        // Architectures
+        binding.tvLibraryArchitectures.text = if (result.architectures.isNotEmpty()) {
+            result.architectures.joinToString(", ")
+        } else {
+            "None detected"
+        }
+        
+        // Version
+        binding.tvLibraryVersion.text = "${result.versionName} (${result.versionCode})"
+        
+        // Split APK
+        binding.tvLibrarySplitApk.text = if (result.isSplitApk) "Yes" else "No"
+
+        // Warning for Flutter Apps
+        if (result.technology == AppTechnology.FLUTTER) {
+             android.app.AlertDialog.Builder(this)
+                .setTitle("Flutter Detected")
+                .setMessage("This app uses Flutter. For SSL pinning bypass, please use the 'reFlutter' framework which is designed specifically for this purpose.\n\nAutomated patching has been removed to ensure better compatibility and stability.")
+                .setPositiveButton("OK", null)
+                .show()
+        }
+    }
+    
+    /**
+     * Reset library analysis results UI.
+     */
+    private fun resetLibraryAnalysisResults() {
+        binding.layoutLibraryResults.visibility = View.GONE
+    }
+    
+    /**
+     * Show error message.
+     */
+    private fun showError(message: String) {
+        Toast.makeText(this, message, Toast.LENGTH_LONG).show()
     }
 }

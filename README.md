@@ -17,55 +17,32 @@ A root Android application for managing Frida server on rooted devices.
 - USB and Remote connection modes
 - Random port generation for remote mode
 - Local version caching
-- **WiFi Proxy Settings**: Configure system-wide WiFi proxy without going to settings
-  - Set proxy address and port
-  - Configure bypass list
-  - Apply/Clear proxy with one tap
+- **Transparent Proxy Settings**:
+  - Redirect TCP (HTTP/HTTPS) to proxy with `iptables`
+  - Block UDP (QUIC) to force TCP fallback (bypass SSL pinning on some apps)
+  - Block IPv6 support
+  - **Granular Transparent Proxy Control**: Redirect TCP, Block UDP (QUIC), Block IPv6
+- **Library Analysis**: Detect app technologies
 - Dark theme UI
 
 ## Requirements
-
 - Rooted Android device
-- Android 5.0+ (API 21+)
+- Android 7.0+ (API 24+)
 - Magisk or similar root solution
 
 ## Usage
-
 1. Launch the app
 2. Choose binary naming option (random recommended for anti-detection)
 3. Select Frida version from dropdown
 4. Click "Check & Download Frida" to download
 5. Click "Start Server" to run Frida server
-6. **IMPORTANT for spawn mode (`-f` flag):** After first start, **reboot your device** to apply USAP settings
-
-## Connection Modes
-
-**USB Mode**: Default mode for ADB connection
-```
-frida -U
-```
-
-**Remote Mode**: Network-based connection with custom port
-```
-frida -H <device_ip>:<port>
-```
-
-## Version Compatibility
-
-- Android 11+ (API 30+): Frida 16.x recommended
-- Android 10 and below: Latest version supported
-
-## Anti-Detection
-
-The app supports binary name randomization to avoid detection by apps that check for "frida-server" process. A random 5-character alphabetic name is generated on each app launch if enabled.
+6. **IMPORTANT for spawn mode (-f flag):** After first start, **reboot your device** to apply USAP settings
 
 ## Troubleshooting
-
 ### "Failed to spawn: unexpectedly timed out" Error
-
 If you get timeout errors when using Frida with `-f` (spawn mode):
 
-**⚠️ CRITICAL: The app automatically disables USAP when starting Frida server, but you MUST REBOOT your device for the settings to take effect!**
+**CRITICAL: The app automatically disables USAP when starting Frida server, but you MUST REBOOT your device for the settings to take effect!**
 
 **Steps:**
 1. Start Frida server from the app (first time)
@@ -112,6 +89,16 @@ If still having issues:
 ```
 
 ## Changelog
+
+### v1.2.0 (2026-02-01)
+- **New Feature**: Granular Transparent Proxy Control
+  - **Redirect TCP**: Redirect HTTP/HTTPS traffic to proxy via iptables
+  - **Block UDP**: Block UDP 80/443 (QUIC) to force TCP fallback (Essential for Flutter)
+  - **Block IPv6**: Block IPv6 traffic
+- **Refactor**: Major Cleanup - Focus on Analysis & Utility
+  - Removed static APK patching features
+  - Enhanced "Library Check" with Flutter detection and reFlutter recommendation
+  - Codebase cleanup for stability
 
 ### v1.1.0 (2026-01-29)
 - **New Feature**: WiFi Proxy Settings
